@@ -1,93 +1,32 @@
-import { test, expect, describe } from "bun:test";
-import { formatResults, formatTraceResults, formatMultitermResults } from "./format";
-import type { SearchMatch } from "./search/keyword";
-import type { FileTraceResult } from "./search/file-trace";
-import type { MultitermSearchMatch } from "./search/multiterm-sql";
+import { test, expect, describe } from "vitest";
 
-describe("formatResults", () => {
-  test("renders a single match with project directory", () => {
-    const matches: SearchMatch[] = [
-      {
-        sessionID: "ses_001",
-        sessionTitle: "Implement storage layer",
-        timestamp: 1706745600000,
-        matchType: "title",
-        excerpt: "Implement storage layer",
-        context: "Implement storage layer",
-        projectDirectory: "/mock/project",
-      },
-    ];
+import { formatFileEdits, formatSessionResults } from "./format";
+import type { FileEdit, SessionMatch } from "./results";
 
-    const output = formatResults(matches);
-    expect(output).toContain("Implement storage layer");
-    expect(output).toContain("ses_001");
-    expect(output).toContain("/mock/project");
-    expect(output).toContain("2024-02-01");
-    expect(output).toContain("Found 1 matches");
-  });
+test("all result formats use the local calendar date and time near UTC midnight", () => {
+  // Under America/Los_Angeles this instant is 2024-01-31 16:05:06.
+  const timestamp = Date.UTC(2024, 1, 1, 0, 5, 6);
+  const date = new Date(timestamp);
+  const expected = `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, "0")}-${String(date.getDate()).padStart(2, "0")} ${date.toTimeString().split(" ")[0]}`;
+  const common = { sessionID: "s", sessionTitle: "title", timestamp, projectDirectory: "/project" };
 
-  test("renders multiple matches with their project directories", () => {
-    const matches: SearchMatch[] = [
-      {
-        sessionID: "ses_001",
-        sessionTitle: "First session",
-        timestamp: 1000,
-        matchType: "title",
-        excerpt: "First",
-        context: "First",
-        projectDirectory: "/project/a",
-      },
-      {
-        sessionID: "ses_002",
-        sessionTitle: "Second session",
-        timestamp: 2000,
-        matchType: "message",
-        excerpt: "Second",
-        context: "Second",
-        projectDirectory: "/project/b",
-      },
-    ];
-
-    const output = formatResults(matches);
-    expect(output).toContain("/project/a");
-    expect(output).toContain("/project/b");
-    expect(output).toContain("First session");
-    expect(output).toContain("Second session");
-    expect(output).toContain("Found 2 matches");
-  });
-
-  test("returns empty message when no matches", () => {
-    const output = formatResults([]);
-    expect(output).toBe("No matches found in conversation history.");
-  });
-
-  test("includes context when it differs from excerpt", () => {
-    const matches: SearchMatch[] = [
-      {
-        sessionID: "ses_001",
-        sessionTitle: "Test",
-        timestamp: 1000,
-        matchType: "message",
-        excerpt: "short",
-        context:
-          "some longer context that includes the word short in the middle",
-        projectDirectory: "/mock/project",
-      },
-    ];
-
-    const output = formatResults(matches);
-    expect(output).toContain("Context");
-    expect(output).toContain("short");
-  });
+  for (const output of [
+    formatFileEdits([
+      { ...common, firstTouch: true, filePath: "a.ts", userPrompt: null, toolName: null },
+    ]),
+    formatSessionResults([{ ...common, termHits: new Map() }]),
+  ]) {
+    expect(output).toContain(`- Date: ${expected}`);
+  }
 });
 
-describe("formatTraceResults", () => {
-  test("renders a single file trace match", () => {
-    const matches: FileTraceResult[] = [
+describe("formatFileEdits", () => {
+  test("renders a single file edit", () => {
+    const matches: FileEdit[] = [
       {
         sessionID: "ses_001",
         sessionTitle: "Build auth module",
-        timestamp: 1706745600000,
+        timestamp: new Date(2024, 1, 1).getTime(),
         firstTouch: true,
         userPrompt: "build me an auth module",
         toolName: "write",
@@ -95,18 +34,19 @@ describe("formatTraceResults", () => {
       },
     ];
 
-    const output = formatTraceResults(matches);
+    const output = formatFileEdits(matches);
+
     expect(output).toContain("Build auth module");
     expect(output).toContain("ses_001");
-    expect(output).toContain("First seen");
+    expect(output).toContain("First edit of this file");
     expect(output).toContain("src/auth.ts");
     expect(output).toContain("write");
-    expect(output).toContain('build me an auth module');
-    expect(output).toContain("Found 1 file trace matches");
+    expect(output).toContain("build me an auth module");
+    expect(output).toContain("Found 1 file edits");
   });
 
-  test("renders later touch status", () => {
-    const matches: FileTraceResult[] = [
+  test("renders later edit status", () => {
+    const matches: FileEdit[] = [
       {
         sessionID: "ses_002",
         sessionTitle: "Fix bug",
@@ -118,64 +58,69 @@ describe("formatTraceResults", () => {
       },
     ];
 
-    const output = formatTraceResults(matches);
-    expect(output).toContain("Later touch");
+    const output = formatFileEdits(matches);
+
+    expect(output).toContain("Later edit");
     expect(output).not.toContain("Preceding User Prompt");
   });
 
   test("returns empty message when no matches", () => {
-    const output = formatTraceResults([]);
-    expect(output).toBe("No file trace matches found in conversation history.");
+    const output = formatFileEdits([]);
+
+    expect(output).toBe("No file edits found in conversation history.");
   });
 });
 
-describe("formatMultitermResults", () => {
-  const sampleResult = (overrides: Partial<MultitermSearchMatch> = {}): MultitermSearchMatch => ({
+describe("formatSessionResults", () => {
+  // eslint-disable-next-line unicorn/consistent-function-scoping -- Keep this fixture scoped to its test suite.
+  const sampleResult = (overrides: Partial<SessionMatch> = {}): SessionMatch => ({
     sessionID: "ses_001",
     sessionTitle: "Train truck model",
-    timestamp: 1706745600000,
+    timestamp: new Date(2024, 1, 1).getTime(),
     projectDirectory: "/project/a",
     termHits: new Map(),
     ...overrides,
   });
 
-  test("formats multiterm results with one section per session", () => {
-    const results: MultitermSearchMatch[] = [
+  test("formats session results with one section per session", () => {
+    const results: SessionMatch[] = [
       sampleResult({ sessionID: "ses_001", sessionTitle: "First" }),
       sampleResult({ sessionID: "ses_002", sessionTitle: "Second" }),
     ];
 
-    const output = formatMultitermResults(results);
+    const output = formatSessionResults(results);
+
     expect(output).toContain("Found 2 sessions");
     expect(output.match(/## /g)!.length).toBe(2);
   });
 
-  test("lists matched terms under each session", () => {
+  test("lists matched words under each session", () => {
     const termHits = new Map();
-    termHits.set("truck", { partID: "p1", matchType: "text", excerpt: "we trained truck" });
-    termHits.set("vertex", { partID: "p2", matchType: "text", excerpt: "vertex ai" });
-    termHits.set("gemini", { partID: "p3", matchType: "text", excerpt: "gemini-2.5" });
 
-    const output = formatMultitermResults([
-      sampleResult({ termHits }),
-    ]);
-    expect(output).toContain("Matched terms: truck, vertex, gemini");
+    termHits.set("truck", { messageID: "p1", excerpt: "we trained truck" });
+    termHits.set("vertex", { messageID: "p2", excerpt: "vertex ai" });
+    termHits.set("gemini", { messageID: "p3", excerpt: "gemini-2.5" });
+
+    const output = formatSessionResults([sampleResult({ termHits })]);
+
+    expect(output).toContain("Matched words: truck, vertex, gemini");
   });
 
-  test("each session shows excerpt for each matched term", () => {
+  test("each session shows excerpt for each matched word", () => {
     const termHits = new Map();
-    termHits.set("truck", { partID: "p1", matchType: "text", excerpt: "we trained truck" });
-    termHits.set("vertex", { partID: "p2", matchType: "text", excerpt: "vertex ai" });
 
-    const output = formatMultitermResults([
-      sampleResult({ termHits }),
-    ]);
+    termHits.set("truck", { messageID: "p1", excerpt: "we trained truck" });
+    termHits.set("vertex", { messageID: "p2", excerpt: "vertex ai" });
+
+    const output = formatSessionResults([sampleResult({ termHits })]);
+
     expect(output).toContain("truck: we trained truck");
     expect(output).toContain("vertex: vertex ai");
   });
 
   test("empty array returns no-match message", () => {
-    const output = formatMultitermResults([]);
+    const output = formatSessionResults([]);
+
     expect(output).toContain("No sessions found");
   });
 });

@@ -1,335 +1,107 @@
-# opencode-history-search
+# @xtruder/opencode-history-search
 
-[![npm version](https://img.shields.io/npm/v/opencode-history-search.svg)](https://www.npmjs.com/package/opencode-history-search)
-[![npm downloads](https://img.shields.io/npm/dm/opencode-history-search.svg)](https://www.npmjs.com/package/opencode-history-search)
-[![Tests](https://github.com/joeyism/opencode-history-search/workflows/Tests/badge.svg)](https://github.com/joeyism/opencode-history-search/actions)
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+OpenCode v2 agent tools built on one search: `history-search-messages` returns matching message excerpts; `history-search-sessions` returns matching sessions or projects without message content; `history-search-edits` returns file edits with the prompts behind them; `history-read` reads messages around a result.
 
-Search through your OpenCode conversation history across ALL projects or within the current repository. Supports keyword, regex, fuzzy, and global search.
+## Development installation
 
-<video src="https://github.com/user-attachments/assets/f492da67-3f54-4989-abb3-2d40c3a8fe7c" autoplay loop muted playsinline width="100%"></video>
+```sh
+npm ci
+npm run build
+```
 
-## Features
+Register the checkout directory in OpenCode's `plugins` configuration. The directory entry is `index.js` → `dist/history-search.js`. Requires OpenCode `>=2.0.16 <3`; Node/Bun must include SQLite FTS5 with the trigram tokenizer.
 
-- **Keyword Search** - Find exact matches in your conversation history
-- **Regex Search** - Use regular expressions for advanced pattern matching
-- **Fuzzy Search** - Typo-tolerant search that finds matches even with spelling errors
-- **Multi-Term AND Search** - Find sessions matching multiple concepts at once (e.g., `["truck", "vertex", "gemini"]`)
-- **Date Filtering** - Filter by "today", "last 7 days", "2024-01", date ranges, and more
-- **Role Filtering** - Search only your messages (`user`) or only AI responses (`assistant`)
-- **File Modification Tracking** - Find which sessions modified specific files
-- **Multiple Match Types** - Search across session titles, messages, tool invocations, and file paths
-- **Global Search** - Search across ALL projects on your machine with `searchAllProjects: true`
-- **Project-Aware Results** - See which project directory each result came from
-- **Fast** - Single-term queries ~500ms; multi-term session-level AND ~1s (on 100k+ parts)
-- **SQLite + JSON Support** - Works with OpenCode v1.2+ (SQLite) and v1.1.x (JSON files)
+## Search index
 
-## Installation
+The plugin owns a disposable SQLite database, separate from OpenCode's database. Tables: `sessions` (one row per session: project, directory, title, last activity, and sync bookkeeping), `documents` (one searchable document per message, plus session titles), `document_paths` (edited file paths per message) and an external-content FTS5 trigram index over `documents`. SQLite also creates its own FTS shadow tables. The schema version lives in `PRAGMA user_version`; an index with an older layout is dropped and rebuilt by backfill. No session/part replica tables, direct OpenCode SQL, worker threads or custom SQLite extensions.
 
-### OpenCode Config (Recommended)
+Two independent jobs keep the index current, running in parallel. **Backfill** runs at startup (and again if the event subscription fails, since events after the failure are lost): it lists every session through the official API and refreshes those whose title, project, directory, or last activity (the later of `time.updated` and `time.idle`, since new messages don't bump `time.updated`) differs from the index. **Live sync** handles in-process session events, recorded from startup even before the service is discovered; token deltas are ignored. Each affected session is fetched on its own and in full, at most once a second while events keep arriving; a session that fails to refresh is logged once and retried with backoff (up to 10 minutes) without holding up others. The two never coordinate in memory: each write carries the time its fetch started, and `sessions` rejects a write older than the indexed one or than the session's deletion (a tombstone kept for a day), so a slow backfill can't overwrite newer live data or revive a deleted session. Search queries the available index without awaiting either, then applies project/role/date filtering, grouping, ordering and limiting in SQL. Results can be incomplete while backfill is in progress.
 
-Add to your OpenCode config (`~/.config/opencode/opencode.json`):
+The index uses WAL, a busy timeout, retry on simultaneous startup, and write-locked (`BEGIN IMMEDIATE`) session replacement, so the stale-write check and the write are atomic even across independent processes sharing the file. SQLite still serializes writers. Search and index writes are synchronous: very broad/short queries or a large backfill can briefly block the host; removing workers does not make SQLite asynchronous.
+
+The index lives at `<OpenCode data directory>/history-search/index-v1.sqlite`, where the data directory comes from OpenCode's own `@opencode/util/global-roots` resolver (`XDG_DATA_HOME/opencode`, or `~/.local/share/opencode`). It contains private conversation text, including tool content; the plugin creates its directory with owner-only permissions. Stop OpenCode before deleting the index to rebuild it. It is not a backup of history. Message text is stored once, case-preserved, with a separate FTS5 trigram index; edited file paths live in an indexed `document_paths` table.
+
+Backfill and history-read use `Service.discover()` to call the registered OpenCode service's official session/message API. Missing registration is retried in the background; the existing index remains searchable. OpenCode v2.0.16 does not give server plugins `session.list`, `message.list`, or their standalone server endpoint. The data-directory path determines where the index lives, but does not validate that a discovered service uses the same data directory. Configure and run the registered service with the same OpenCode data directory as the plugin host; without it, new history cannot be backfilled or read.
+
+### Query syntax (all search tools)
+
+All three search tools run the same search; they differ only in how results are aggregated. `query` uses GitHub-style syntax:
+
+- `login token`: sessions containing every word (case-insensitive substrings, in any message or the title). Words and phrases need at least 3 characters.
+- `"token refresh"`: a phrase, spaces included.
+- `-revert`, `-"old api"`: drop sessions that contain the word or phrase anywhere.
+- `path:src/auth.ts`: sessions with completed write/edit calls or snapshot paths for the file (in `history-search-edits`, the edits of that file). Relative paths match at slash boundaries; absolute paths require equality; quote paths with spaces (`path:"My Docs/a.ts"`).
+- `project:<ID>` or `project:<path>`: search another project. A value without `/` is a project ID. A value with `/` (or starting with `~`) is a checkout or worktree path: it selects the project with sessions in that directory or below it, then searches all of that project's worktrees. `project:all` searches every project. Without `project:`, only the current project is searched.
+- Only `path:` and `project:` are qualifiers, so text like `error: x` or URLs stays literal. `OR` and parentheses are not supported.
+
+Shared inputs:
+
+- `role`: `user` or `assistant`; limits which messages words can match (titles always count). Exclusions always consider the whole session.
+- `date`: `today`, `yesterday`, `last N days/weeks/months`, `YYYY-MM-DD`, `YYYY-MM`, or `YYYY-MM-DD to YYYY-MM-DD`. Limits which messages words match, or which edits are returned.
+- `limit`: positive integer; see each tool for defaults and caps. Filters apply before limiting.
+
+### `history-search-messages`
+
+Needs at least one word or phrase. Returns matching sessions, newest first, with the first matching message ID and a 300-character excerpt for each word. `path:` only narrows to sessions that edited the file. `limit` defaults to 50 and is capped at 50 (with a notice).
+
+### `history-search-edits`
+
+Returns file edits, newest first: completed write/edit calls and snapshot paths, each with the session, message ID, tool, the preceding user prompt (300 characters) and its message ID. `path:src/auth.ts` gives one file's history; words alone list every file edited in matching sessions; an empty query lists recent edits. Paths are deduplicated per message. “First edit of this file” marks the earliest indexed edit of that path in project scope, counted before date/text/limit filtering—not Git creation history. `limit` defaults to 50 and is capped at 50.
+
+### `history-search-sessions`
+
+Returns matching sessions without message content: title, Session ID, update time, directory and project ID, newest first. `limit` defaults to 20, capped at 50. An empty query lists the current project's recent sessions; `project:~/Code/app` lists that project's sessions including its worktrees. `show: "projects"` returns matching projects instead, one line per project with its directories and matching-session count, largest first (`limit` up to 100); use it with `project:all` for "which projects mention X?". Results come from the search index, so sessions appear once indexed.
+
+## `history-read` inputs
+
+`sessionID` defaults to the current session; pass a Session ID from a search result to read another, in any project. Add an optional `messageID` to read around a hit. This is a bounded **text view**, not a full session export.
+
+| Input                | Default / bounds             | Meaning                                                                                                                                        |
+| -------------------- | ---------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------- |
+| `sessionID`          | Current session              | Session to read.                                                                                                                               |
+| `messageID`          | Absent                       | Anchor for a context window; cannot be combined with `cursor` or `limit`.                                                                      |
+| `before`, `after`    | `5` each; integers `0..50`   | Eligible messages on either side of the anchor. Only valid with `messageID`.                                                                   |
+| `cursor`             | Absent                       | Message ID to read **after**, exclusively. Use the previous response's `nextCursor`; this is not an OpenCode API cursor.                       |
+| `limit`              | `20`; integer `1..100`       | Page size without an anchor.                                                                                                                   |
+| `role`               | Both                         | Optional `"user"` or `"assistant"`. Other native event types are never returned.                                                               |
+| `maxCharsPerMessage` | `2000`; integer `100..20000` | Maximum UTF-16 code units in each returned `content`, including tool summaries and inline markers. IDs and JSON metadata are outside this cap. |
+| `includeToolResults` | `false`                      | Opt in to tool text output and structured errors. Tool inputs/metadata are never returned.                                                     |
+
+Read around a match:
 
 ```json
-{
-  "$schema": "https://opencode.ai/config.json",
-  "plugin": [
-    "opencode-history-search"
-  ]
-}
+{ "sessionID": "ses_…", "messageID": "msg_…", "before": 3, "after": 5 }
 ```
 
-Then restart OpenCode.
+Read only user messages, then continue with the returned cursor:
 
-### Quick Install
-
-```bash
-# Using npx (npm)
-npx opencode-history-search
-
-# Using bunx (bun)
-bunx opencode-history-search
-
-# From GitHub directly
-npx github:joeyism/opencode-history-search
+```json
+{ "sessionID": "ses_…", "role": "user", "limit": 20, "maxCharsPerMessage": 1000 }
 ```
 
-The installer copies the tool to `~/.opencode/tool/` and creates the description file. Then restart OpenCode.
-
-### Manual Installation
-
-```bash
-git clone https://github.com/joeyism/opencode-history-search.git
-cd opencode-history-search
-bun install
-bun run build
-bun run install:tool
+```json
+{ "sessionID": "ses_…", "role": "user", "limit": 20, "cursor": "<nextCursor>" }
 ```
 
-## Use Cases
+The tool returns a JSON string with `sessionID`, chronological `messages`, and `nextCursor` (`null` at the end). Each message includes `messageID`, `role`, `content`, `truncated`, `toolResultsOmitted`, and `otherContentOmitted`. Truncation flags are outside the content cap, so even a cut-off inline marker is unambiguous. Default tool summaries contain names and `[tool results omitted]`, not inputs, outputs, errors, or metadata. `otherContentOmitted` marks omitted attachments, reasoning/non-text parts, or tool input/metadata. This text view also excludes message-level metadata, model accounting and snapshots.
 
-Things you can ask OpenCode once this tool is installed:
+Filtering happens **before** counting neighbors or filling pages. An excluded-role anchor still locates the window, but is not returned (`anchorIncluded: false`); eligible neighbors on both sides are returned. An anchor window contains at most `before + after + 1` messages. `nextCursor` continues after the window (or the anchor for an empty/exclusively-before window). Drop `messageID`/`before`/`after` when continuing, and keep the same role to avoid changing the traversal. Missing sessions, anchors, or cursor messages are errors, not empty results or a reset to page one.
 
-### Find something you worked on but forgot which project
+Reading currently scans all native message pages of **one session** on each call, in batches of 100. It retains those messages while selecting the window/page; the output caps do not cap network traffic or scan memory. Repeated native cursors fail explicitly. API requests support cancellation. It is not a transactional snapshot: concurrent edits/deletions can change subsequent pages. To read more of a truncated message, increase the cap up to 20000; there is no within-message offset or full/binary export.
 
-> "Search across all my projects for conversations about auth code"
+## Verification
 
-> "Find sessions globally where you wrote a database migration"
-
-> "Which project did we discuss the rate limiting implementation?"
-
-### Find sessions where a file was created or modified
-
-> "Find me sessions where you created or modified `src/install.ts`"
-
-> "Which sessions touched anything under `src/utils/`?"
-
-> "Show me every time you edited the auth module"
-
-### Find something you worked on recently
-
-> "Find sessions from the last 7 days where we talked about storage"
-
-> "What did we work on yesterday?"
-
-> "Show me sessions from January where we discussed authentication"
-
-### Recall something the AI said or implemented
-
-> "Find sessions where you explained how fuzzy search works"
-
-> "Search my history for where you wrote a Bun SQLite query"
-
-> "Find sessions where you mentioned ripgrep"
-
-### Recall something you asked
-
-> "Find sessions where I asked about rate limiting" _(role: user)_
-
-> "Search only my messages for 'how do I'"
-
-### Find sessions by topic when you can't remember the exact wording
-
-> "Find sessions related to 'autentication'" _(fuzzy — catches typos)_
-
-> "Search for 'databse connection'" _(fuzzy — finds "database connection")_
-
-### Find sessions matching multiple concepts at once
-
-> "Find sessions about training gemini with truck data" _(multi-term — matches all concepts across any part of the session)_
-
-> "Search for sessions that mention both 'authentication' and 'rate limiting'"
-
-> "Find conversations where we used vertex and gemini and discussed fine-tuning"
-
-### Find sessions where a specific tool was used
-
-> "Find sessions where you ran grep on the codebase"
-
-> "Show me sessions where you used the bash tool"
-
-### Search with a pattern
-
-> "Find all sessions that touched any `.test.ts` file"
-
-> "Find sessions mentioning any `stor*.ts` file"
-
-## Parameters
-
-| Parameter        | Type                      | Default     | Description                                            |
-| ---------------- | ------------------------- | ----------- | ------------------------------------------------------ |
-| `searchAllProjects` | boolean                   | `false`     | Search ALL projects on this machine (set to `true` for global search) |
-| `query`          | string                    | _required_  | Search query (keyword, regex, or fuzzy term). Required unless `filePath` or `terms` is provided. |
-| `terms`          | string[]                  | _none_      | Array of terms to search for with AND semantics — returns sessions that contain ALL terms across any part. For 2+ terms. SQLite-only. |
-| `filePath`       | string                    | _none_      | Trace touch history for a file path.                   |
-| `mode`           | `"keyword"` \| `"fuzzy"`  | `"keyword"` | Search mode                                            |
-| `regex`          | boolean                   | `false`     | Treat query as regex (keyword mode only)               |
-| `caseSensitive`  | boolean                   | `false`     | Enable case-sensitive search (keyword mode only)       |
-| `fuzzyThreshold` | number                    | `0.4`       | Fuzzy match strictness 0.0-1.0 (fuzzy mode only)       |
-| `date`           | string                    | _none_      | Filter by date (see [Date Filtering](#date-filtering)) |
-| `limit`          | number                    | `50`        | Maximum number of results                              |
-| `role`           | `"user"` \| `"assistant"` | _none_      | Filter by message role (omit to search both)           |
-
-## Search Modes
-
-### Keyword Search
-
-Finds exact matches (case-insensitive by default).
-
-```typescript
-{ query: "storage", mode: "keyword" }
-// Finds: "storage", "Storage", "STORAGE"
-// Does not find: "storag", "storing"
+```sh
+npm run typecheck
+npm run lint
+npm run format:check
+npm run test:all
 ```
 
-### Regex Search
+Development uses Node, Vite, Vitest, type-aware Oxlint and Oxfmt. The integration test starts OpenCode 2.0.16 with isolated HOME/XDG paths and invokes both tools through a test-only RPC probe. It covers API pagination, message and session search, file tracing, message windows, content bounds/omissions and in-process lifecycle events. It makes no model calls or live-history changes. Multi-process tests exercise concurrent writes to different sessions in one index file.
 
-Uses regular expressions for pattern matching.
+CI also installs the production tarball and runs integration in UTC and America/Los_Angeles. `HISTORY_PLUGIN_PATH` selects the installed package for that check. The package contains a single built ESM bundle; test fixtures and source-only helpers are not shipped.
 
-```typescript
-{ query: "stor.*ge", regex: true }
-// Finds: "storage", "storeage"
-```
+## Attribution
 
-### Fuzzy Search
-
-Tolerates typos and variations using Levenshtein distance.
-
-```typescript
-{ query: "storag", mode: "fuzzy", fuzzyThreshold: 0.3 }
-// Finds: "storage" (missing letter)
-
-{ query: "ripgrap", mode: "fuzzy", fuzzyThreshold: 0.4 }
-// Finds: "ripgrep" (transposition)
-```
-
-### Multi-Term AND Search
-
-Search for sessions that contain **all** of multiple concepts at once. Each term is matched as a substring across session titles and part content (text, tool inputs/outputs, file paths). Returns one result per session, with an excerpt for each matched term.
-
-```typescript
-{
-  terms: ["truck", "vertex", "gemini"],
-  searchAllProjects: true,
-  limit: 20
-}
-// Returns sessions whose parts collectively contain "truck" AND "vertex" AND "gemini"
-// (terms can be in different parts of the same session)
-```
-
-Multi-term search is **session-level**: a session matches if all terms appear anywhere in its content, even across different messages. This is useful when you remember multiple concepts from a session but not a single connecting phrase. SQLite-only (uses single-query conditional aggregation for performance).
-
-## Date Filtering
-
-| Format                       | Example                            | Description                      |
-| ---------------------------- | ---------------------------------- | -------------------------------- |
-| `"today"`                    | `date: "today"`                    | Today (00:00:00 - 23:59:59)      |
-| `"yesterday"`                | `date: "yesterday"`                | Yesterday                        |
-| `"last N days"`              | `date: "last 7 days"`              | Last N days from now             |
-| `"last N weeks"`             | `date: "last 2 weeks"`             | Last N weeks from now            |
-| `"last N months"`            | `date: "last 3 months"`            | Last N months from now           |
-| `"YYYY-MM-DD"`               | `date: "2024-01-15"`               | Specific day                     |
-| `"YYYY-MM"`                  | `date: "2024-01"`                  | Entire month                     |
-| `"YYYY-MM-DD to YYYY-MM-DD"` | `date: "2024-01-01 to 2024-01-31"` | Date range (inclusive)           |
-
-## Output Format
-
-```
-Found 3 matches in conversation history:
-
-## Implement storage layer
-- Session ID: ses_abc123...
-- Project: /home/user/projects/my-app
-- Date: 2026-02-01 10:30:00
-- Match Type: title
-- Excerpt: "Implement storage layer"
-
-## Fix storage bug
-- Session ID: ses_def456...
-- Date: 2026-01-31 14:20:15
-- Match Type: message
-- Excerpt: "The storage module has a bug..."
-- Context: ...need to fix the storage module has a bug in the...
-```
-
-### Match Types
-
-| Type        | What it matches                                           |
-| ----------- | --------------------------------------------------------- |
-| `title`     | Session title                                             |
-| `message`   | Text content of a user or assistant message               |
-| `tool`      | Tool name (grep, edit, bash, read, etc.)                  |
-| `filepath`  | File paths in tool inputs/outputs or patch parts          |
-
-### Multi-Term Output Format
-
-When using `terms` (multi-term AND search), output is session-grouped with per-term excerpts:
-
-```
-Found 3 sessions in conversation history:
-
-## Train truck model on Vertex
-- Session ID: ses_abc123...
-- Project: /home/user/projects/my-app
-- Date: 2026-07-15
-- Matched terms: truck, vertex, gemini
-  - truck: ...we trained truck model on data...
-  - vertex: ...please use vertex ai...
-  - gemini: ...tune gemini-2.5-flash...
-
-## Another session
-- Session ID: ses_def456...
-- Project: /home/user/projects/other
-- Date: 2026-07-10
-- Matched terms: truck, vertex, gemini
-  - truck: ...NonTruckExamples/x.ts...
-  - vertex: ...GOOGLE_VERTEX_LOCATION=global...
-  - gemini: ...gemini-service-account.json...
-```
-
-## How It Works
-
-1. **Storage**: Auto-detects SQLite (v1.2+) or JSON files (v1.1.x) — SQLite preferred when present
-2. **Project Scoping**: By default, scopes searches to current repository via git root commit hash. Set `searchAllProjects: true` to search across all projects.
-3. **Indexing**: For fuzzy search, builds a searchable index of all content
-4. **Matching**: Applies chosen search algorithm (keyword, regex, or fuzzy)
-5. **Sorting**: Returns results sorted by timestamp (newest first)
-
-## Storage Structure
-
-### OpenCode v1.2+ (SQLite)
-
-```
-~/.local/share/opencode/opencode.db
-```
-
-### OpenCode v1.1.x (Legacy JSON)
-
-```
-~/.local/share/opencode/storage/
-├── session/{projectID}/ses_*.json
-├── message/{sessionID}/msg_*.json
-└── part/{messageID}/part_*.json
-```
-
-SQLite is used when `opencode.db` is present, otherwise falls back to JSON files.
-
-## Development
-
-```bash
-# Run unit tests
-bun run test
-
-# Run integration tests (requires real OpenCode data)
-bun run test:integration
-
-# Build
-bun run build
-```
-
-### Project Structure
-
-```
-src/
-├── index.ts                  # Tool definition & main entry
-├── format.ts                 # Output formatting (single-term, multi-term, file-trace)
-├── storage.ts                # JSON storage backend (v1.1.x)
-├── storage-sqlite.ts         # SQLite storage backend (v1.2+)
-├── storage-provider.ts       # Auto-detects backend, unified API
-└── search/
-    ├── keyword.ts            # Keyword & regex search (single-term, per-part)
-    ├── multiterm-sql.ts       # Multi-term AND search (session-level, SQL-based)
-    ├── fuzzy.ts              # Fuzzy search
-    ├── file-trace.ts         # File touch history tracing
-    └── date-filter.ts        # Date filtering
-```
-
-## License
-
-MIT
-
-## Acknowledgments
-
-- Built for [OpenCode](https://opencode.ai)
-- Uses [Fuse.js](https://fusejs.io/) for fuzzy search
-- Powered by [Bun](https://bun.sh)
+Fork of [joeyism/opencode-history-search](https://github.com/joeyism/opencode-history-search), maintained at [xtruder/opencode-history-search](https://github.com/xtruder/opencode-history-search). Original MIT license and attribution are preserved. This scoped package has not yet been published.

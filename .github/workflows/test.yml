@@ -6,50 +6,41 @@ on:
   pull_request:
     branches: [main, dev]
 
+permissions:
+  contents: read
+
 jobs:
   test:
-    name: Test on ${{ matrix.os }}
+    name: Node / ${{ matrix.os }} / ${{ matrix.tz }}
     runs-on: ${{ matrix.os }}
     strategy:
       matrix:
         os: [ubuntu-latest, macos-latest]
-
+        tz: [UTC, America/Los_Angeles]
+    env:
+      TZ: ${{ matrix.tz }}
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-
-      - name: Setup Bun
-        uses: oven-sh/setup-bun@v1
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
         with:
-          bun-version: latest
-
-      - name: Install dependencies
-        run: bun install
-
-      - name: Run unit tests
-        run: bun run test
-
-      - name: Run build
-        run: bun run build
-
-      - name: Verify bundle exists
-        run: test -f dist/history-search.ts
-
-  lint:
-    name: Lint and Type Check
-    runs-on: ubuntu-latest
-
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-
-      - name: Setup Bun
-        uses: oven-sh/setup-bun@v1
-        with:
-          bun-version: latest
-
-      - name: Install dependencies
-        run: bun install
-
-      - name: Type check
-        run: bun run typecheck
+          node-version: "26"
+          cache: npm
+      - run: npm ci
+      - run: npm run typecheck
+      - run: npm run lint
+      - run: npm run format:check
+      - name: Install official pinned OpenCode v2 CLI
+        run: |
+          npm install --prefix "$RUNNER_TEMP/opencode-cli" @opencode/cli@2.0.16
+          echo "$RUNNER_TEMP/opencode-cli/node_modules/.bin" >> "$GITHUB_PATH"
+      - name: Verify host version
+        run: test "$(opencode --version)" = "opencode v2.0.16"
+      - name: Build and unit tests
+        run: npm test
+      - name: Verify production package in isolated real host
+        run: |
+          test -f dist/history-search.js
+          test ! -e dist/history-worker.js
+          npm pack --ignore-scripts --pack-destination "$RUNNER_TEMP"
+          npm install --prefix "$RUNNER_TEMP/production" --omit=dev "$RUNNER_TEMP"/xtruder-opencode-history-search-*.tgz
+          HISTORY_PLUGIN_PATH="$RUNNER_TEMP/production/node_modules/@xtruder/opencode-history-search" node test/integration.ts

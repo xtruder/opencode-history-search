@@ -1,36 +1,19 @@
 {
   "compilerOptions": {
-    // Environment setup & latest features
     "lib": ["ESNext"],
     "target": "ESNext",
     "module": "Preserve",
     "moduleDetection": "force",
-    "jsx": "react-jsx",
-    "allowJs": true,
-
-    // Bundler mode
     "moduleResolution": "bundler",
     "allowImportingTsExtensions": true,
     "verbatimModuleSyntax": true,
     "noEmit": true,
-
-    // Best practices
+    "allowJs": true,
+    "types": ["node"],
     "strict": true,
     "skipLibCheck": true,
     "noFallthroughCasesInSwitch": true,
-    "noUncheckedIndexedAccess": true,
-    "noImplicitOverride": true,
-
-    // Some stricter flags (disabled by default)
-    "noUnusedLocals": false,
-    "noUnusedParameters": false,
-    "noPropertyAccessFromIndexSignature": false
+    "noUncheckedIndexedAccess": true
   },
-  "exclude": [
-    "node_modules",
-    "dist",
-    "test/comprehensive-test.ts",
-    "test/comprehensive-test-with-data.ts",
-    "verify-installation.ts"
-  ]
+  "exclude": ["node_modules", "dist", ".temp"]
 }

@@ -1,0 +1,5 @@
+{
+  "name": "history-test-probe",
+  "type": "module",
+  "main": "index.ts"
+}

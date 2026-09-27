@@ -1,4 +1,11 @@
-import { describe, test, expect } from "bun:test";
+import { describe, test, expect, beforeEach, afterEach, vi } from "vitest";
+
+beforeEach(() => {
+  vi.useFakeTimers();
+  vi.setSystemTime(new Date("2024-06-15T12:34:56Z"));
+});
+afterEach(() => vi.useRealTimers());
+
 import { parseDateFilter, filterByDate, type DateRange } from "./date-filter";
 
 describe("parseDateFilter", () => {
@@ -22,6 +29,7 @@ describe("parseDateFilter", () => {
   test("parses 'yesterday' to previous day range", () => {
     const result = parseDateFilter("yesterday");
     const yesterday = new Date();
+
     yesterday.setDate(yesterday.getDate() - 1);
 
     expect(result.start.getFullYear()).toBe(yesterday.getFullYear());
@@ -39,6 +47,7 @@ describe("parseDateFilter", () => {
     const result = parseDateFilter("last 7 days");
     const now = new Date();
     const sevenDaysAgo = new Date();
+
     sevenDaysAgo.setDate(sevenDaysAgo.getDate() - 7);
 
     expect(result.start.getDate()).toBe(sevenDaysAgo.getDate());
@@ -49,6 +58,7 @@ describe("parseDateFilter", () => {
   test("parses 'last N weeks' correctly", () => {
     const result = parseDateFilter("last 2 weeks");
     const fourteenDaysAgo = new Date();
+
     fourteenDaysAgo.setDate(fourteenDaysAgo.getDate() - 14);
 
     expect(result.start.getDate()).toBe(fourteenDaysAgo.getDate());
@@ -58,6 +68,7 @@ describe("parseDateFilter", () => {
   test("parses 'last N months' correctly", () => {
     const result = parseDateFilter("last 3 months");
     const threeMonthsAgo = new Date();
+
     threeMonthsAgo.setMonth(threeMonthsAgo.getMonth() - 3);
 
     expect(result.start.getMonth()).toBe(threeMonthsAgo.getMonth());
@@ -66,6 +77,7 @@ describe("parseDateFilter", () => {
 
   test("handles singular 'last 1 day'", () => {
     const result = parseDateFilter("last 1 day");
+
     expect(result.start).toBeDefined();
     expect(result.end).toBeDefined();
   });
@@ -112,10 +124,23 @@ describe("parseDateFilter", () => {
     expect(result.end.getHours()).toBe(23);
   });
 
+  // Calendar inputs mean local calendar days, just like today/yesterday.
+  test("local calendar ranges include both midnights across DST", () => {
+    const range = parseDateFilter("2024-03-10 to 2024-03-11");
+
+    expect(range.start).toEqual(new Date(2024, 2, 10));
+    expect(range.end).toEqual(new Date(2024, 2, 11, 23, 59, 59, 999));
+  });
+
+  test.each(["2024-02-30", "2023-02-29", "2024-00", "2024-02-30 to 2024-03-02"])(
+    "rejects invalid calendar input %s rather than normalizing",
+    (input) => {
+      expect(() => parseDateFilter(input)).toThrow(/Invalid date/);
+    },
+  );
+
   test("throws error for invalid date format", () => {
-    expect(() => parseDateFilter("invalid")).toThrow(
-      /Unrecognized date filter format/,
-    );
+    expect(() => parseDateFilter("invalid")).toThrow(/Unrecognized date filter format/);
   });
 
   test("throws error for invalid ISO date", () => {
@@ -136,6 +161,7 @@ describe("parseDateFilter", () => {
 
   test("handles extra whitespace", () => {
     const result = parseDateFilter("  today  ");
+
     expect(result.start).toBeDefined();
     expect(result.end).toBeDefined();
   });
@@ -172,6 +198,7 @@ describe("filterByDate", () => {
     };
 
     const filtered = filterByDate(mockResults, range);
+
     expect(filtered.length).toBe(3);
     expect(filtered.map((r) => r.id)).toEqual(["1", "2", "3"]);
   });
@@ -183,8 +210,11 @@ describe("filterByDate", () => {
     };
 
     const filtered = filterByDate(mockResults, range);
+
     expect(filtered.length).toBe(1);
+
     const first = filtered[0];
+
     expect(first).toBeDefined();
     expect(first?.id).toBe("2");
   });
@@ -196,6 +226,7 @@ describe("filterByDate", () => {
     };
 
     const filtered = filterByDate(mockResults, range);
+
     expect(filtered.length).toBe(0);
   });
 
@@ -206,6 +237,7 @@ describe("filterByDate", () => {
     };
 
     const filtered = filterByDate(mockResults, range);
+
     expect(filtered.length).toBe(2);
     expect(filtered.map((r) => r.id)).toEqual(["1", "2"]);
   });
@@ -217,6 +249,7 @@ describe("filterByDate", () => {
     };
 
     const filtered = filterByDate(mockResults, range);
+
     expect(filtered.length).toBe(4);
   });
 
@@ -227,6 +260,7 @@ describe("filterByDate", () => {
     };
 
     const filtered = filterByDate([], range);
+
     expect(filtered.length).toBe(0);
   });
 });

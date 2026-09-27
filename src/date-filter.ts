@@ -1,9 +1,26 @@
 /**
  * Date filtering utilities for search results
  * Supports natural language dates: "today", "yesterday", "last N days/weeks/months"
+ * All calendar inputs use the host local timezone, consistently with today/yesterday.
+ * Boundaries are inclusive and DST-aware, not UTC-parsed ISO instants.
  * Supports ISO dates: "YYYY-MM-DD"
  * Supports date ranges: "YYYY-MM-DD to YYYY-MM-DD"
  */
+
+// Date.parse treats ISO days as UTC. Construct local components instead, and
+// reject overflow (e.g. February 30). setFullYear preserves years 0000–0099.
+function calendarDate(input: string): Date {
+  const [year, month, day] = input.split("-").map(Number);
+  const date = new Date(0);
+
+  date.setFullYear(year!, month! - 1, day);
+  date.setHours(0, 0, 0, 0);
+  if (date.getFullYear() !== year || date.getMonth() !== month! - 1 || date.getDate() !== day) {
+    throw new Error(`Invalid date: ${input}`);
+  }
+
+  return date;
+}
 
 export interface DateRange {
   start: Date;
@@ -22,24 +39,33 @@ export function parseDateFilter(filter: string): DateRange {
   // Today: 00:00:00 to 23:59:59 today
   if (normalized === "today") {
     const start = new Date();
+
     start.setHours(0, 0, 0, 0);
+
     const end = new Date();
+
     end.setHours(23, 59, 59, 999);
+
     return { start, end };
   }
 
   // Yesterday: 00:00:00 to 23:59:59 yesterday
   if (normalized === "yesterday") {
     const start = new Date();
+
     start.setDate(start.getDate() - 1);
     start.setHours(0, 0, 0, 0);
+
     const end = new Date(start);
+
     end.setHours(23, 59, 59, 999);
+
     return { start, end };
   }
 
   // "last N days/weeks/months" - from N units ago until now
   const relativeMatch = normalized.match(/^last (\d+) (day|week|month)s?$/);
+
   if (relativeMatch && relativeMatch[1] && relativeMatch[2]) {
     const count = parseInt(relativeMatch[1], 10);
     const unit = relativeMatch[2];
@@ -55,16 +81,17 @@ export function parseDateFilter(filter: string): DateRange {
     }
 
     start.setHours(0, 0, 0, 0);
+
     return { start, end };
   }
 
   // Date range: "YYYY-MM-DD to YYYY-MM-DD"
-  const rangeMatch = normalized.match(
-    /^(\d{4}-\d{2}-\d{2})\s+to\s+(\d{4}-\d{2}-\d{2})$/,
-  );
+  const rangeMatch = normalized.match(/^(\d{4}-\d{2}-\d{2})\s+to\s+(\d{4}-\d{2}-\d{2})$/);
+
   if (rangeMatch && rangeMatch[1] && rangeMatch[2]) {
-    const start = new Date(rangeMatch[1]);
-    const end = new Date(rangeMatch[2]);
+    const start = calendarDate(rangeMatch[1]);
+    const end = calendarDate(rangeMatch[2]);
+
     end.setHours(23, 59, 59, 999); // Include entire end date
 
     if (isNaN(start.getTime()) || isNaN(end.getTime())) {
@@ -80,13 +107,15 @@ export function parseDateFilter(filter: string): DateRange {
 
   // Single date: "YYYY-MM-DD" or "YYYY-MM" (month)
   const isoMatch = normalized.match(/^(\d{4}-\d{2}(?:-\d{2})?)$/);
+
   if (isoMatch && isoMatch[1]) {
     const dateStr = isoMatch[1];
 
     // Month only (YYYY-MM)
     if (dateStr.match(/^\d{4}-\d{2}$/)) {
-      const start = new Date(`${dateStr}-01`);
+      const start = calendarDate(`${dateStr}-01`);
       const end = new Date(start);
+
       end.setMonth(end.getMonth() + 1);
       end.setDate(0); // Last day of month
       end.setHours(23, 59, 59, 999);
@@ -99,8 +128,9 @@ export function parseDateFilter(filter: string): DateRange {
     }
 
     // Full date (YYYY-MM-DD)
-    const start = new Date(dateStr);
-    const end = new Date(dateStr);
+    const start = calendarDate(dateStr);
+    const end = calendarDate(dateStr);
+
     end.setHours(23, 59, 59, 999);
 
     if (isNaN(start.getTime())) {
@@ -127,6 +157,7 @@ export function filterByDate<T extends { timestamp: number }>(
 ): T[] {
   return results.filter((result) => {
     const timestamp = new Date(result.timestamp);
+
     return timestamp >= dateRange.start && timestamp <= dateRange.end;
   });
 }
